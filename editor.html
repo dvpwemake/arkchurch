@@ -785,6 +785,12 @@ const TOK = {
   if(/^dvpwemake\/appchurch$/i.test(r)) LS.set('gh_repo','dvpwemake/arkchurch');
 })();
 function getToken(){ return TOK.get(); }
+// No token yet (nothing saved in this browser): no pop-up, just take the person to the token box once. After the first Save & Test it is saved and filled in by itself.
+function needCreds(){
+  const el = document.getElementById('gh-token');
+  if(typeof showGhStatus === 'function') showGhStatus('gh-status','Paste the GitHub token here once, then Save & Test. It is saved encrypted in this browser and filled in by itself from then on.','info');
+  if(el){ el.scrollIntoView({block:'center'}); el.focus(); }
+}
 const DEFAULT_REPO = 'dvpwemake/arkchurch';
 function showApp(){
   document.getElementById('auth-gate').classList.add('hidden');
@@ -1053,7 +1059,7 @@ function saveSrcModal(){
 
 async function saveSourcesJson(){
   const c = ghCreds();
-  if(!c.repo||!c.token){ alert('Configure GitHub credentials first (top of page).'); return; }
+  if(!c.repo||!c.token){ needCreds(); return; }
   const btn=document.getElementById('btn-save-sources');
   btn.disabled=true; btn.textContent='Saving…';
   const cfg = LS.get('config') || DEFAULT_CONFIG;
@@ -1473,7 +1479,7 @@ async function deleteAnn(idx){
 
 async function saveAnnToGithub(){
   const c = ghCreds();
-  if(!c.repo||!c.token){ alert('Configure GitHub credentials first.'); return; }
+  if(!c.repo||!c.token){ needCreds(); return; }
   const r = await ghApi(`repos/${c.repo}/contents/index.html?ref=${c.branch||'main'}&t=${Date.now()}`);
   if(!r.ok){ alert('✗ Could not fetch index.html: '+(r.data?.message||'')); return; }
   const html = decodeGhContent(r.data.content);
