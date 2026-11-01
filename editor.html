@@ -39,7 +39,7 @@ input,textarea,select{font-family:var(--fs);font-size:13px;color:var(--text)}
 .auth-input{width:100%;padding:.7rem 1rem;border:1.5px solid var(--border-md);border-radius:var(--r);font-size:.95rem;text-align:center;letter-spacing:.15em;margin-bottom:.9rem;transition:border-color var(--tr)}
 .auth-input:focus{border-color:var(--gold);outline:none}
 .auth-link{display:block;margin:.8rem auto 0;color:var(--text-dim);font-size:.8rem;text-decoration:underline}
-#gate-tid[hidden],#gate-setup[hidden],#gate-pw[hidden]{display:none}
+#gate-tid[hidden],#gate-pw[hidden]{display:none}
 .auth-btn{width:100%;padding:.72rem;background:var(--navy);color:#fff;border-radius:var(--r);font-size:.9rem;font-weight:600;transition:background var(--tr)}
 .auth-btn:hover{background:var(--navy-dk)}
 .auth-err{color:var(--crimson);font-size:.8rem;margin-top:.5rem;min-height:1.2em}
@@ -229,12 +229,6 @@ tbody td{padding:.6rem .85rem;vertical-align:middle}
       <p>Enter your editor password to continue</p>
       <input id="pw-input" type="password" class="auth-input" placeholder="Password" autocomplete="current-password">
       <button class="auth-btn" onclick="doLogin()">Enter Editor</button>
-    </div>
-    <div id="gate-setup" hidden>
-      <p>Use Touch ID next time: paste the GitHub token once. It is locked in this browser by Touch ID and never leaves it.</p>
-      <input id="gate-setup-pat" type="password" class="auth-input" placeholder="ghp_… or github_pat_…" autocomplete="off">
-      <button class="auth-btn" id="gate-setup-btn" type="button">Save with Touch ID</button>
-      <button class="auth-link" id="gate-setup-skip" type="button">Not now</button>
     </div>
     <div id="auth-err" class="auth-err"></div>
   </div>
@@ -733,21 +727,65 @@ async function passwordHash(){
   return LS.get('pwh') || PW_SHA256;
 }
 function failState(){ try{ return JSON.parse(sessionStorage.getItem(FAIL_KEY)||'{"n":0,"until":0}'); }catch(e){ return {n:0,until:0}; } }
-// The GitHub token lives for the session only (sessionStorage); Touch ID puts it back. An older copy in localStorage is moved over once.
+// The GitHub token is saved once, encrypted, in this browser and filled in by itself at every sign-in (owner 2026-11-01: no typing it again).
+// The key comes from the editor password (PBKDF2-SHA-256 -> AES-GCM-256): the password is never stored, only the derived key for the session (sessionStorage, gone when the tab closes).
+const VAULT_KEY = 'appchurch_ed_vault_v2', SKEY = 'appchurch_ed_vk_s';
+const b64 = u8 => btoa(String.fromCharCode(...u8)), unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const readVault = () => { try{ const v = JSON.parse(localStorage.getItem(VAULT_KEY)); return v && v.s && v.iv && v.ct ? v : null; }catch(e){ return null; } };
+async function pbkdf2(pw, salt){
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name:'PBKDF2', hash:'SHA-256', salt, iterations: 200000 }, base, 256));
+}
+const aesFrom = raw => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt','decrypt']);
+const sessionKey = () => { try{ const s = sessionStorage.getItem(SKEY); return s ? unb64(s) : null; }catch(e){ return null; } };
+async function vaultSeal(token, raw, salt){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv }, await aesFrom(raw), new TextEncoder().encode(token)));
+  localStorage.setItem(VAULT_KEY, JSON.stringify({ s: b64(salt), iv: b64(iv), ct: b64(ct) }));
+}
+// Called at a password sign-in: open the saved token (or create the vault from a token already in this browser) and fill it in.
+async function vaultUnlock(pw){
+  const v = readVault();
+  let salt = v ? unb64(v.s) : crypto.getRandomValues(new Uint8Array(16));
+  const raw = await pbkdf2(pw, salt);
+  try{ sessionStorage.setItem(SKEY, b64(raw)); }catch(e){}
+  if(v){
+    try{
+      const plain = await crypto.subtle.decrypt({ name:'AES-GCM', iv: unb64(v.iv) }, await aesFrom(raw), unb64(v.ct));
+      TOK.set(new TextDecoder().decode(plain), true);
+    }catch(e){ /* the password was changed in another browser: the saved token cannot be opened here; paste it once more */ }
+    return;
+  }
+  // no vault yet: an older plain token (localStorage or this session) is sealed now and the plain copy removed
+  const legacy = LS.get('gh_token');
+  const tok = (typeof legacy === 'string' && legacy) ? legacy : TOK.get();
+  if(tok){ await vaultSeal(tok, raw, salt); TOK.set(tok, true); LS.del('gh_token'); }
+  else { localStorage.setItem('appchurch_ed_vsalt', b64(salt)); }
+}
 const TOK = {
   get: () => { try{ return sessionStorage.getItem('appchurch_ed_gh_token_s') || ''; }catch(e){ return ''; } },
-  set: v => { try{ sessionStorage.setItem('appchurch_ed_gh_token_s', v); }catch(e){} },
+  // set(v): keep it for the session and, when this sign-in has a key, save it encrypted (skip=true when it was just read from the vault)
+  set: (v, skip) => {
+    try{ sessionStorage.setItem('appchurch_ed_gh_token_s', v); }catch(e){}
+    const raw = sessionKey();
+    if(!skip && v && raw){
+      const v0 = readVault();
+      const salt = v0 ? unb64(v0.s) : (localStorage.getItem('appchurch_ed_vsalt') ? unb64(localStorage.getItem('appchurch_ed_vsalt')) : crypto.getRandomValues(new Uint8Array(16)));
+      vaultSeal(v, raw, salt).catch(()=>{});
+    }
+  },
   del: () => { try{ sessionStorage.removeItem('appchurch_ed_gh_token_s'); }catch(e){} }
 };
 (function migrateLegacy(){
+  // an older plain token is used for this session at once; it is sealed (and the plain copy removed) at the next password sign-in
   const old = LS.get('gh_token');
-  if(typeof old === 'string' && old){ if(!TOK.get()) TOK.set(old); }
-  if(old !== null) LS.del('gh_token');
+  if(typeof old === 'string' && old && !TOK.get()) { try{ sessionStorage.setItem('appchurch_ed_gh_token_s', old); }catch(e){} }
   // This repo was renamed appchurch -> arkchurch (2026-11-01); the name appchurch is now another site. Never publish to it from here.
   const r = (LS.get('gh_repo')||'').trim();
   if(/^dvpwemake\/appchurch$/i.test(r)) LS.set('gh_repo','dvpwemake/arkchurch');
 })();
 function getToken(){ return TOK.get(); }
+const DEFAULT_REPO = 'dvpwemake/arkchurch';
 function showApp(){
   document.getElementById('auth-gate').classList.add('hidden');
   document.getElementById('app').classList.add('visible');
@@ -758,11 +796,13 @@ async function doLogin(){
   err.textContent = '';
   const f = failState();
   if(f.until && Date.now() < f.until){ err.textContent = 'Too many attempts. Try again in ~'+Math.ceil((f.until-Date.now())/60000)+' min.'; return; }
-  if(await sha256(input.value) === await passwordHash()){
+  const pwText = input.value;
+  if(await sha256(pwText) === await passwordHash()){
     input.value = '';
     sessionStorage.removeItem(FAIL_KEY);
     sessionStorage.setItem(SESSION_KEY, '1');
-    afterPassword();
+    await vaultUnlock(pwText).catch(()=>{});
+    showApp();
   } else {
     const s = failState(); s.n = (s.n||0)+1;
     if(s.n >= MAX_FAILS){ s.until = Date.now()+LOCK_MIN*60000; s.n = 0; }
@@ -770,15 +810,6 @@ async function doLogin(){
     err.textContent = 'Incorrect password. Try again.';
     input.value = ''; input.focus();
   }
-}
-let usedFallback = false;
-// After a password sign-in on a Touch ID device: offer "Use Touch ID next time" once.
-async function afterPassword(){
-  const T = window.ArkTouchID;
-  if(!T || (T.enrolled() ? !usedFallback : T.skipped()) || !(await T.supported())) return showApp();
-  document.getElementById('gate-pw').hidden = true;
-  document.getElementById('gate-setup').hidden = false;
-  document.getElementById('gate-setup-pat').value = getToken();
 }
 function doLogout(){
   sessionStorage.removeItem(SESSION_KEY);
@@ -802,28 +833,9 @@ document.getElementById('pw-input').addEventListener('keydown', e => { if(e.key 
       else err.textContent = res.message || 'Touch ID failed.';
     });
     document.getElementById('gate-other').addEventListener('click', () => {
-      usedFallback = true; err.textContent = '';
+      err.textContent = '';
       document.getElementById('gate-tid').hidden = true; document.getElementById('gate-pw').hidden = false;
       document.getElementById('pw-input').focus();
-    });
-  }
-  if(T){
-    document.getElementById('gate-setup-btn').addEventListener('click', async e => {
-      const pat = document.getElementById('gate-setup-pat').value.trim();
-      err.textContent = '';
-      if(!T.validToken(pat)){ err.textContent = 'Paste a GitHub token (ghp_… or github_pat_…).'; return; }
-      e.target.disabled = true; err.textContent = 'Checking the token with GitHub…';
-      let res = await T.checkToken(pat);
-      if(res.ok){ err.textContent = 'Touch ID…'; res = await T.save(pat, true); }
-      e.target.disabled = false;
-      if(res.ok){ document.getElementById('gate-setup-pat').value = ''; err.textContent = ''; TOK.set(pat); showApp(); return; }
-      if(res.noPrf){ T.setSkipped(true); e.target.hidden = true; document.getElementById('gate-setup-skip').textContent = 'Continue to the editor'; }
-      err.textContent = res.message || 'Touch ID setup failed.';
-    });
-    document.getElementById('gate-setup-skip').addEventListener('click', () => {
-      if(!T.enrolled()) T.setSkipped(true);
-      document.getElementById('gate-setup-pat').value = '';
-      showApp();
     });
   }
 })();
@@ -858,7 +870,7 @@ function showPanel(id){
 //  GITHUB CREDENTIALS
 // ═══════════════════════════════════════════════════════════════════
 function ghCreds(){
-  return { repo: LS.get('gh_repo')||'', token: getToken(), branch: LS.get('gh_branch')||'main' };
+  return { repo: LS.get('gh_repo')||DEFAULT_REPO, token: getToken(), branch: LS.get('gh_branch')||'main' };
 }
 function loadGhCredsToUI(){
   const c = ghCreds();
@@ -1490,12 +1502,15 @@ async function changePassword(){
   if(nw.length<6){ showGhStatus('pw-status','New password must be at least 6 characters.','err'); return; }
   if(nw!==conf){ showGhStatus('pw-status','Passwords do not match.','err'); return; }
   LS.set('pwh', await sha256(nw)); // only the hash is kept, in this browser
+  const tk = getToken();
+  if(tk){ const salt = crypto.getRandomValues(new Uint8Array(16)); const raw = await pbkdf2(nw, salt); try{ sessionStorage.setItem(SKEY, b64(raw)); }catch(e){} await vaultSeal(tk, raw, salt); } // the saved token follows the new password
   ['pw-current','pw-new','pw-confirm'].forEach(id=>document.getElementById(id).value='');
   showGhStatus('pw-status','✓ Password updated successfully.','ok');
 }
 function clearAll(){
   if(!confirm('Clear all local editor data? (GitHub token, repo, cached news, sources, config)\n\nThis does NOT affect the live site.')) return;
   ['pw','pwh','gh_repo','gh_token','gh_branch','sources','config','anns','cached_news'].forEach(k=>LS.del(k));
+  try{ localStorage.removeItem(VAULT_KEY); localStorage.removeItem('appchurch_ed_vsalt'); sessionStorage.removeItem(SKEY); }catch(e){}
   TOK.del(); if(window.ArkTouchID) ArkTouchID.forget();
   alert('Local data cleared. Reload the page.');
   location.reload();
